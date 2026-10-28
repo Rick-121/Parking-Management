@@ -1,0 +1,8 @@
+owner,owner123,owner
+admin_gateway,admin123,admin,GATEWAY
+admin_pavilion,admin123,admin,PAVILION
+admin_lalucia,admin123,admin,LALUCIA
+Rick1,Rick1,customer
+rick2,rick2,customer
+rick3,rick3,customer
+rick4,rick4,customer

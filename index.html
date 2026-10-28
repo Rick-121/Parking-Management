@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KZN Mall Parking</title>
+<!-- index.html - browser version of the KZN Mall Parking Management System
+     same malls, pricing and roles as the Python program, but data is kept
+     in the browser (localStorage) instead of the txt files -->
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+    <div class="inner">
+        <div>
+            <h1>KwaZulu-Natal Mall Parking</h1>
+            <p>Parking Management System</p>
+        </div>
+        <div id="user-bar" class="hidden">
+            <span id="user-label"></span>
+            <button class="secondary" onclick="logout()">Log out</button>
+        </div>
+    </div>
+</header>
+
+<main id="app"></main>
+
+<footer>Data is saved in this browser only.</footer>
+
+<script>
+// ---------- "files" (kept in localStorage, same layout as the txt files) ----------
+// users      = username,password,role (admins have a 4th field, their mall id)
+// malls      = mall_id,name,capacity,pricing_type
+// records    = record_id,username,mall_id,entry_time,exit_time,fee
+// payments   = payment_id,record_id,amount,paid_at
+
+const USERS_FILE = "users";
+const MALLS_FILE = "malls";
+const RECORDS_FILE = "parking_records";
+const PAYMENTS_FILE = "payments";
+
+const USER_NAME = 0, USER_PASS = 1, USER_ROLE = 2, USER_MALL = 3;
+const MALL_ID = 0, MALL_NAME = 1, MALL_CAPACITY = 2, MALL_PRICING = 3;
+const REC_ID = 0, REC_USER = 1, REC_MALL = 2, REC_IN = 3, REC_OUT = 4, REC_FEE = 5;
+const PAY_ID = 0, PAY_RECORD = 1, PAY_AMOUNT = 2, PAY_TIME = 3;
+
+const STARTER_MALLS = [
+    ["GATEWAY", "Gateway Theatre of Shopping", "250", "flat"],
+    ["PAVILION", "Pavilion Shopping Centre", "180", "hourly"],
+    ["LALUCIA", "La Lucia Mall", "150", "hourly_capped"],
+];
+
+const STARTER_USERS = [
+    ["owner", "owner123", "owner"],
+    ["admin_gateway", "admin123", "admin", "GATEWAY"],
+    ["admin_pavilion", "admin123", "admin", "PAVILION"],
+    ["admin_lalucia", "admin123", "admin", "LALUCIA"],
+];
+
+// fallback if localStorage is blocked (private window etc.) - data just won't survive a refresh
+const memoryStore = {};
+
+function readLines(name) {
+    let text = null;
+    try {
+        text = localStorage.getItem("kzn_" + name);
+    } catch (e) {
+        text = memoryStore[name] || null;
+    }
+    if (!text) return [];
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        return [];
+    }
+}
+
+function rewriteFile(name, rows) {
+    const text = JSON.stringify(rows);
+    memoryStore[name] = text;
+    try {
+        localStorage.setItem("kzn_" + name, text);
+    } catch (e) {
+        // ignore, memoryStore still has it
+    }
+}
+
+function appendLine(name, row) {
+    const rows = readLines(name);
+    rows.push(row);
+    rewriteFile(name, rows);
+}
+
+function setupFiles() {
+    if (readLines(MALLS_FILE).length === 0) rewriteFile(MALLS_FILE, STARTER_MALLS);
+    if (readLines(USERS_FILE).length === 0) rewriteFile(USERS_FILE, STARTER_USERS);
+}
+
+function findUser(username) {
+    return readLines(USERS_FILE).find(u => u[USER_NAME] === username) || null;
+}
+
+function getMalls() {
+    return readLines(MALLS_FILE);
+}
+
+function findMall(mallId) {
+    return getMalls().find(m => m[MALL_ID] === mallId) || null;
+}
+
+function mallName(mallId) {
+    const mall = findMall(mallId);
+    return mall ? mall[MALL_NAME] : "Unknown mall";
+}
+
+function getNextId(name, column) {
+    let highest = 0;
+    for (const row of readLines(name)) {
+        highest = Math.max(highest, parseInt(row[column], 10));
+    }
+    return String(highest + 1);
+}
+
+function countParked(mallId) {
+    return readLines(RECORDS_FILE).filter(r => r[REC_MALL] === mallId && r[REC_OUT] === "").length;
+}
+
+function spacesFree(mallId) {
+    return parseInt(findMall(mallId)[MALL_CAPACITY], 10) - countParked(mallId);
+}
+
+function getActiveRecord(username, mallId) {
+    return readLines(RECORDS_FILE).find(r =>
+        r[REC_USER] === username && r[REC_MALL] === mallId && r[REC_OUT] === "") || null;
+}
+
+function getRecordsForUser(username) {
+    return readLines(RECORDS_FILE).filter(r => r[REC_USER] === username);
+}
+
+function getRecordsForMall(mallId) {
+    return readLines(RECORDS_FILE).filter(r => r[REC_MALL] === mallId);
+}
+
+function getUnpaidRecords(username, mallId) {
+    const paidIds = readLines(PAYMENTS_FILE).map(p => p[PAY_RECORD]);
+    return getRecordsForUser(username).filter(r =>
+        r[REC_OUT] !== "" && r[REC_MALL] === mallId && !paidIds.includes(r[REC_ID]));
+}
+
+function getPaymentsForUser(username) {
+    const recordIds = getRecordsForUser(username).map(r => r[REC_ID]);
+    return readLines(PAYMENTS_FILE).filter(p => recordIds.includes(p[PAY_RECORD]));
+}
+
+// ---------- pricing (same rules as pricing.py) ----------
+
+const GATEWAY_FLAT_RATE = 15.00;
+
+function calculateHours(minutes) {
+    // round up to the next hour, minimum 1 hour
+    let hours = Math.floor(minutes / 60);
+    if (minutes % 60 !== 0) hours = hours + 1;
+    if (hours === 0) hours = 1;
+    return hours;
+}
+
+function calculateFee(pricingType, minutes) {
+    if (pricingType === "flat") return GATEWAY_FLAT_RATE;
+    if (pricingType === "hourly") return calculateHours(minutes) * 10.00;
+    if (pricingType === "hourly_capped") return Math.min(calculateHours(minutes) * 12.00, 60.00);
+    return 0;
+}
+
+function pricingDescription(pricingType) {
+    if (pricingType === "flat") return "Flat rate: R15.00 per visit";
+    if (pricingType === "hourly") return "Hourly: R10.00 per hour";
+    if (pricingType === "hourly_capped") return "Hourly: R12.00 per hour, capped at R60.00";
+    return pricingType;
+}
+
+// ---------- validation (same rules as validation.py) ----------
+
+function validateText(text, label, minLen) {
+    if (text.length < minLen) return `${label} must be at least ${minLen} characters long.`;
+    if (text.includes(",")) return `${label} cannot contain a comma.`;
+    return "";
+}
+
+// ---------- time helpers (same "YYYY-MM-DD HH:MM" format as main.py) ----------
+
+function pad(n) {
+    return String(n).padStart(2, "0");
+}
+
+function nowText() {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function parseTime(text) {
+    const [datePart, timePart] = text.split(" ");
+    const [y, mo, d] = datePart.split("-").map(Number);
+    const [h, mi] = timePart.split(":").map(Number);
+    return new Date(y, mo - 1, d, h, mi);
+}
+
+function minutesBetween(startText, endText) {
+    return Math.floor((parseTime(endText) - parseTime(startText)) / 60000);
+}
+
+function money(amount) {
+    return "R" + Number(amount).toFixed(2);
+}
+
+function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------- page state ----------
+
+const app = document.getElementById("app");
+let currentUser = null;
+let activeMall = null;
+let ownerMall = null;
+let loginAttempts = 3;
+let flash = null;   // {type, text} shown once on the next render
+
+function showMessage(type, text) {
+    flash = { type, text };
+    render();
+}
+
+function messageHtml() {
+    if (!flash) return "";
+    const html = `<div class="message ${flash.type}">${escapeHtml(flash.text)}</div>`;
+    flash = null;
+    return html;
+}
+
+function render() {
+    const userBar = document.getElementById("user-bar");
+    if (!currentUser) {
+        userBar.classList.add("hidden");
+        renderAuth();
+        return;
+    }
+    userBar.classList.remove("hidden");
+    document.getElementById("user-label").textContent =
+        `${currentUser[USER_NAME]} (${currentUser[USER_ROLE]})  `;
+
+    const role = currentUser[USER_ROLE];
+    if (role === "customer") renderCustomer();
+    else if (role === "admin") renderAdmin();
+    else if (role === "owner") renderOwner();
+}
+
+// ---------- login / register ----------
+
+let authTab = "login";
+
+function renderAuth() {
+    const isLogin = authTab === "login";
+    app.innerHTML = `
+        <div class="auth-wrap card">
+            <div class="tabs">
+                <button class="${isLogin ? "" : "secondary"}" onclick="switchTab('login')">Log in</button>
+                <button class="${isLogin ? "secondary" : ""}" onclick="switchTab('register')">Register</button>
+            </div>
+            ${isLogin ? `
+                <h2>Log in</h2>
+                <form onsubmit="login(event)">
+                    <label for="username">Username</label>
+                    <input id="username" autocomplete="username" required>
+                    <label for="password">Password</label>
+                    <input id="password" type="password" autocomplete="current-password" required>
+                    <button class="full-width" type="submit">Log in</button>
+                </form>
+            ` : `
+                <h2>Register as a new driver</h2>
+                <form onsubmit="register(event)">
+                    <label for="username">Choose a username</label>
+                    <input id="username" autocomplete="username" required>
+                    <label for="password">Choose a password</label>
+                    <input id="password" type="password" autocomplete="new-password" required>
+                    <label for="password2">Type the password again</label>
+                    <input id="password2" type="password" autocomplete="new-password" required>
+                    <button class="full-width" type="submit">Create account</button>
+                </form>
+            `}
+            ${messageHtml()}
+        </div>`;
+}
+
+function switchTab(tab) {
+    authTab = tab;
+    render();
+}
+
+function login(event) {
+    event.preventDefault();
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value;
+    const user = findUser(username);
+
+    let error = "";
+    if (user === null) error = "no account exists with that username";
+    else if (user[USER_PASS] !== password) error = "that password is incorrect";
+
+    if (error === "") {
+        loginAttempts = 3;
+        currentUser = user;
+        activeMall = null;
+        ownerMall = null;
+        showMessage("success", `Login successful. Welcome, ${user[USER_NAME]} (${user[USER_ROLE]}).`);
+        return;
+    }
+
+    loginAttempts = loginAttempts - 1;
+    if (loginAttempts > 0) {
+        showMessage("error", `Error: ${error}. ${loginAttempts} attempt(s) left.`);
+    } else {
+        loginAttempts = 3;
+        showMessage("error", "Error: too many failed attempts. Please start again.");
+    }
+}
+
+function register(event) {
+    event.preventDefault();
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value.trim();
+    const again = document.getElementById("password2").value.trim();
+
+    let error = validateText(username, "Username", 3);
+    if (error === "" && findUser(username) !== null) {
+        error = "That username is already taken. Please choose another one.";
+    }
+    if (error === "") error = validateText(password, "Password", 4);
+    if (error === "" && password !== again) error = "The two passwords do not match.";
+
+    if (error !== "") {
+        showMessage("error", "Error: " + error);
+        return;
+    }
+
+    appendLine(USERS_FILE, [username, password, "customer"]);
+    currentUser = findUser(username);
+    activeMall = null;
+    showMessage("success", `Success: account '${username}' has been created.`);
+}
+
+function logout() {
+    currentUser = null;
+    activeMall = null;
+    ownerMall = null;
+    authTab = "login";
+    showMessage("info", "You have been logged out. Goodbye!");
+}
+
+// ---------- shared pieces ----------
+
+function capacityBar(mallId) {
+    const capacity = parseInt(findMall(mallId)[MALL_CAPACITY], 10);
+    const parked = countParked(mallId);
+    const percent = Math.min(100, parked / capacity * 100);
+    let cls = "";
+    if (percent >= 100) cls = "full";
+    else if (percent >= 80) cls = "high";
+    return `<div class="bar"><span class="${cls}" style="width:${percent}%"></span></div>`;
+}
+
+function mallCards(selectedId, onClick) {
+    return `<div class="malls">` + getMalls().map(mall => {
+        const id = mall[MALL_ID];
+        const free = spacesFree(id);
+        return `
+            <div class="mall ${id === selectedId ? "selected" : ""}" onclick="${onClick}('${id}')">
+                <h4>${escapeHtml(mall[MALL_NAME])} ${free <= 0 ? '<span class="badge">FULL</span>' : ""}</h4>
+                <div class="pricing">${pricingDescription(mall[MALL_PRICING])}</div>
+                ${capacityBar(id)}
+                <div>${free} / ${mall[MALL_CAPACITY]} bays free</div>
+            </div>`;
+    }).join("") + `</div>`;
+}
+
+function mallReport(mallId) {
+    // only counts finished visits (exit time filled in), not cars still parked
+    const completed = getRecordsForMall(mallId).filter(r => r[REC_OUT] !== "");
+    let revenue = 0;
+    let minutes = 0;
+    for (const r of completed) {
+        revenue += parseFloat(r[REC_FEE]);
+        minutes += minutesBetween(r[REC_IN], r[REC_OUT]);
+    }
+    const average = completed.length > 0 ? minutes / completed.length : 0;
+    return { vehicles: completed.length, revenue, average };
+}
+
+function parkedTable(mallId) {
+    const parked = getRecordsForMall(mallId).filter(r => r[REC_OUT] === "");
+    if (parked.length === 0) return `<p class="muted">No vehicles are parked here right now.</p>`;
+    const now = nowText();
+    return `<div class="table-wrap"><table>
+        <tr><th>Record</th><th>Driver</th><th>Entered</th><th>Parked for</th></tr>
+        ${parked.map(r => `<tr>
+            <td>${r[REC_ID]}</td>
+            <td>${escapeHtml(r[REC_USER])}</td>
+            <td>${r[REC_IN]}</td>
+            <td>${minutesBetween(r[REC_IN], now)} minute(s)</td>
+        </tr>`).join("")}
+    </table></div>`;
+}
+
+function capacityStats(mallId) {
+    const mall = findMall(mallId);
+    const capacity = parseInt(mall[MALL_CAPACITY], 10);
+    const parked = countParked(mallId);
+    return `
+        <div class="stats">
+            <div class="stat"><div class="label">Bays free</div><div class="value">${capacity - parked} / ${capacity}</div></div>
+            <div class="stat"><div class="label">Occupancy</div><div class="value">${Math.round(parked / capacity * 100)}%</div></div>
+            <div class="stat"><div class="label">Pricing type</div><div class="value small">${pricingDescription(mall[MALL_PRICING])}</div></div>
+        </div>
+        ${capacityBar(mallId)}`;
+}
+
+function reportStats(mallId) {
+    const report = mallReport(mallId);
+    return `
+        <div class="stats">
+            <div class="stat"><div class="label">Total vehicles parked</div><div class="value">${report.vehicles}</div></div>
+            <div class="stat"><div class="label">Total revenue</div><div class="value">${money(report.revenue)}</div></div>
+            <div class="stat"><div class="label">Average duration</div><div class="value">${Math.round(report.average)} min</div></div>
+        </div>`;
+}
+
+// ---------- customer ----------
+
+function renderCustomer() {
+    const username = currentUser[USER_NAME];
+    let mallPanel = `<p class="muted">Choose a mall above to register entry/exit, check your status or pay.</p>`;
+
+    if (activeMall !== null) {
+        const mall = findMall(activeMall);
+        const active = getActiveRecord(username, activeMall);
+        const unpaid = getUnpaidRecords(username, activeMall);
+
+        let status;
+        if (active === null) {
+            status = `<p>You have no vehicle parked at this mall right now.</p>`;
+        } else {
+            const minutes = minutesBetween(active[REC_IN], nowText());
+            status = `<p>Your vehicle entered at <strong>${active[REC_IN]}</strong>
+                      (${minutes} minute(s) ago) and is still parked.</p>`;
+        }
+
+        let charges;
+        if (unpaid.length === 0) {
+            charges = `<p class="muted">You have no outstanding parking charges at this mall.</p>`;
+        } else {
+            const record = unpaid[0];
+            charges = `
+                <p>Outstanding charge: <strong>${money(record[REC_FEE])}</strong>
+                   (pricing type: ${mall[MALL_PRICING]})<br>
+                   <span class="muted">For your visit on ${record[REC_IN]}</span></p>
+                <div class="row">
+                    <button onclick="makePayment()">Confirm payment</button>
+                </div>`;
+        }
+
+        mallPanel = `
+            <p><strong>${escapeHtml(mall[MALL_NAME])}</strong> &middot; ${pricingDescription(mall[MALL_PRICING])}</p>
+            <div class="row">
+                <button onclick="registerEntry()" ${active !== null ? "disabled" : ""}>Register entry</button>
+                <button class="secondary" onclick="registerExit()" ${active === null ? "disabled" : ""}>Register exit</button>
+            </div>
+            <h3>Current parking status</h3>
+            ${status}
+            <h3>Outstanding charges</h3>
+            ${charges}`;
+    }
+
+    app.innerHTML = `
+        ${messageHtml()}
+        <div class="card top-gap">
+            <h2>Select a mall</h2>
+            ${mallCards(activeMall, "selectMall")}
+        </div>
+        <div class="card">
+            <h2>Active mall: ${activeMall ? escapeHtml(mallName(activeMall)) : "No mall selected"}</h2>
+            ${mallPanel}
+        </div>
+        <div class="card">
+            <h2>Your parking history</h2>
+            ${historyTable(username)}
+            <h3>Your payment history</h3>
+            ${paymentTable(username)}
+        </div>`;
+}
+
+function selectMall(mallId) {
+    activeMall = mallId;
+    showMessage("success", `Confirmed: your active mall is now ${mallName(mallId)}.`);
+}
+
+function registerEntry() {
+    const username = currentUser[USER_NAME];
+    if (getActiveRecord(username, activeMall) !== null) {
+        showMessage("error", "Error: your vehicle is already parked at this mall.");
+        return;
+    }
+    if (spacesFree(activeMall) <= 0) {
+        showMessage("error", "Error: this mall is full - no bays available right now.");
+        return;
+    }
+    const recordId = getNextId(RECORDS_FILE, REC_ID);
+    appendLine(RECORDS_FILE, [recordId, username, activeMall, nowText(), "", "0.00"]);
+    showMessage("success", "Entry recorded. Enjoy your shopping!");
+}
+
+function registerExit() {
+    const record = getActiveRecord(currentUser[USER_NAME], activeMall);
+    if (record === null) {
+        showMessage("error", "Error: we have no record of your vehicle entering this mall.");
+        return;
+    }
+    const exitTime = nowText();
+    const minutes = minutesBetween(record[REC_IN], exitTime);
+    const pricingType = findMall(activeMall)[MALL_PRICING];
+    const fee = calculateFee(pricingType, minutes);
+
+    const rows = readLines(RECORDS_FILE);
+    for (const row of rows) {
+        if (row[REC_ID] === record[REC_ID]) {
+            row[REC_OUT] = exitTime;
+            row[REC_FEE] = fee.toFixed(2);
+        }
+    }
+    rewriteFile(RECORDS_FILE, rows);
+
+    showMessage("success",
+        `Exit recorded. Parking duration: ${minutes} minute(s). Pricing type: ${pricingType}. ` +
+        `Amount due: ${money(fee)}. Please pay below before you leave.`);
+}
+
+function makePayment() {
+    const unpaid = getUnpaidRecords(currentUser[USER_NAME], activeMall);
+    if (unpaid.length === 0) {
+        showMessage("info", "You have no outstanding parking charges at this mall.");
+        return;
+    }
+    const record = unpaid[0];
+    const amount = parseFloat(record[REC_FEE]);
+    const paymentId = getNextId(PAYMENTS_FILE, PAY_ID);
+    appendLine(PAYMENTS_FILE, [paymentId, record[REC_ID], amount.toFixed(2), nowText()]);
+    showMessage("success", `Payment confirmed: ${money(amount)} paid. Thank you!`);
+}
+
+function historyTable(username) {
+    const records = getRecordsForUser(username);
+    if (records.length === 0) return `<p class="muted">No parking history yet.</p>`;
+    return `<div class="table-wrap"><table>
+        <tr><th>Record</th><th>Mall</th><th>In</th><th>Out</th><th>Fee</th></tr>
+        ${records.map(r => `<tr>
+            <td>${r[REC_ID]}</td>
+            <td>${escapeHtml(mallName(r[REC_MALL]))}</td>
+            <td>${r[REC_IN]}</td>
+            <td>${r[REC_OUT] === "" ? "still parked" : r[REC_OUT]}</td>
+            <td>${money(r[REC_FEE])}</td>
+        </tr>`).join("")}
+    </table></div>`;
+}
+
+function paymentTable(username) {
+    const payments = getPaymentsForUser(username);
+    if (payments.length === 0) return `<p class="muted">No payments yet.</p>`;
+    return `<div class="table-wrap"><table>
+        <tr><th>Payment</th><th>Record</th><th>Amount</th><th>Paid at</th></tr>
+        ${payments.map(p => `<tr>
+            <td>${p[PAY_ID]}</td>
+            <td>${p[PAY_RECORD]}</td>
+            <td>${money(p[PAY_AMOUNT])}</td>
+            <td>${p[PAY_TIME]}</td>
+        </tr>`).join("")}
+    </table></div>`;
+}
+
+// ---------- admin (only sees their own mall) ----------
+
+function renderAdmin() {
+    const mallId = currentUser[USER_MALL];
+    app.innerHTML = `
+        ${messageHtml()}
+        <div class="card top-gap">
+            <h2>${escapeHtml(mallName(mallId))}</h2>
+            <h3>Parking capacity</h3>
+            ${capacityStats(mallId)}
+        </div>
+        <div class="card">
+            <h2>Vehicles currently parked</h2>
+            ${parkedTable(mallId)}
+        </div>
+        <div class="card">
+            <h2>Mall report</h2>
+            ${reportStats(mallId)}
+        </div>`;
+}
+
+// ---------- owner (can see every mall) ----------
+
+function renderOwner() {
+    let totalRevenue = 0;
+    const rows = getMalls().map(mall => {
+        const report = mallReport(mall[MALL_ID]);
+        totalRevenue += report.revenue;
+        return `<tr>
+            <td>${escapeHtml(mall[MALL_NAME])}</td>
+            <td>${mall[MALL_PRICING]}</td>
+            <td>${report.vehicles}</td>
+            <td>${money(report.revenue)}</td>
+            <td>${Math.round(report.average)} min</td>
+        </tr>`;
+    }).join("");
+
+    let detail = `<p class="muted">Choose a mall above to see it in detail.</p>`;
+    if (ownerMall !== null) {
+        detail = `
+            <h3>Parking capacity</h3>
+            ${capacityStats(ownerMall)}
+            <h3>Vehicles currently parked</h3>
+            ${parkedTable(ownerMall)}
+            <h3>Mall report</h3>
+            ${reportStats(ownerMall)}`;
+    }
+
+    app.innerHTML = `
+        ${messageHtml()}
+        <div class="card top-gap">
+            <h2>Comparative report: all malls</h2>
+            <div class="table-wrap"><table>
+                <tr><th>Mall</th><th>Pricing</th><th>Vehicles</th><th>Revenue</th><th>Avg duration</th></tr>
+                ${rows}
+            </table></div>
+            <p><strong>Total revenue across all malls: ${money(totalRevenue)}</strong></p>
+        </div>
+        <div class="card">
+            <h2>View one mall in detail</h2>
+            ${mallCards(ownerMall, "selectOwnerMall")}
+        </div>
+        <div class="card">
+            <h2>${ownerMall ? escapeHtml(mallName(ownerMall)) : "No mall selected"}</h2>
+            ${detail}
+        </div>`;
+}
+
+function selectOwnerMall(mallId) {
+    ownerMall = mallId;
+    render();
+}
+
+// ---------- start ----------
+
+setupFiles();
+render();
+</script>
+</body>
+</html>

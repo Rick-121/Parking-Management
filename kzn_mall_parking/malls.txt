@@ -1,0 +1,3 @@
+GATEWAY,Gateway Theatre of Shopping,250,flat
+PAVILION,Pavilion Shopping Centre,180,hourly
+LALUCIA,La Lucia Mall,150,hourly_capped
